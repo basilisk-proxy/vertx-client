@@ -5,6 +5,8 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.junit5.VertxExtension;
 import io.vertx.junit5.VertxTestContext;
 import java.util.List;
+
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -29,13 +31,13 @@ class FullFeatureE2eTest {
 
         // Verify configuration is assembled correctly prior to any gateway connection
         ctx.verify(() -> {
-            org.junit.jupiter.api.Assertions.assertEquals("orders", config.serviceId());
-            org.junit.jupiter.api.Assertions.assertEquals("fp-orders", config.fingerprint());
-            org.junit.jupiter.api.Assertions.assertEquals(List.of("/api/orders"), config.pathPrefixes());
+            Assertions.assertEquals("orders", config.serviceId());
+            Assertions.assertEquals("fp-orders", config.fingerprint());
+            Assertions.assertEquals(List.of("/api/orders"), config.pathPrefixes());
         });
 
         var gateway = new GatewayApiClient(vertx, config.gatewayBaseUrl());
-        ctx.verify(() -> org.junit.jupiter.api.Assertions.assertNotNull(gateway));
+        ctx.verify(() -> Assertions.assertNotNull(gateway));
 
         ctx.completeNow();
     }
