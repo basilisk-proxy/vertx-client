@@ -3,6 +3,8 @@ package com.milestone.basilisk.vertx;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 
@@ -27,23 +29,116 @@ public class BusClient {
     private final Vertx vertx;
     private final String serviceId, instanceId;
     private final String connectionKey;
-    private final NetSocket socket;
+    private final String host;
+    private final int port;
+    private final String token;
+    private NetSocket socket;
     private final ArrayDeque<Promise<JsonObject>> pending = new ArrayDeque<>();
     private final Map<String, List<Consumer<JsonObject>>> eventHandlers = new ConcurrentHashMap<>();
     private final Map<String, BiFunction<JsonObject, RequestResponder, Future<Void>>> requestHandlers = new ConcurrentHashMap<>();
     private String buffer = "";
+    private final AtomicLong metricsTimer = new AtomicLong(0);
+    private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+    private volatile boolean closed = false;
     private static final Logger log = LoggerFactory.getLogger(BusClient.class);
 
-    private BusClient(Vertx vertx, String serviceId, String instanceId, NetSocket socket) {
+    private BusClient(Vertx vertx, String serviceId, String instanceId, String host, int port, String token, NetSocket socket) {
         this.vertx = vertx;
         this.serviceId = serviceId;
         this.instanceId = instanceId;
         this.connectionKey = serviceId + ":" + instanceId;
-        this.socket = socket;
+        this.host = host;
+        this.port = port;
+        this.token = token;
+        attachSocketHandlers(socket);
         log.info(("bus client connected connection_key=%s remote=%s").formatted(connectionKey, socket.remoteAddress()));
-        socket.closeHandler(v -> log.warn(("bus client socket closed connection_key=%s remote=%s").formatted(connectionKey, socket.remoteAddress())));
-        socket.exceptionHandler(err -> log.error(("bus client socket error connection_key=%s remote=%s cause=%s").formatted(connectionKey, socket.remoteAddress(), err.getMessage()), err));
+    }
+
+    private void attachSocketHandlers(NetSocket s) {
+        this.socket = s;
+        this.buffer = "";
+        s.closeHandler(v -> {
+            log.warn(("bus client socket closed connection_key=%s remote=%s").formatted(connectionKey, s.remoteAddress()));
+            handleDisconnect();
+        });
+        s.exceptionHandler(err -> {
+            log.error(("bus client socket error connection_key=%s remote=%s cause=%s").formatted(connectionKey, s.remoteAddress(), err.getMessage()), err);
+            handleDisconnect();
+        });
         bindReadLoop();
+    }
+
+    private void handleDisconnect() {
+        if (closed) return;
+        if (!reconnecting.compareAndSet(false, true)) return;
+        cancelMetricsTimer();
+        failPendingRequests(new RuntimeException("connection lost"));
+        scheduleReconnect(0);
+    }
+
+    private void cancelMetricsTimer() {
+        long id = metricsTimer.getAndSet(0);
+        if (id != 0) vertx.cancelTimer(id);
+    }
+
+    private void failPendingRequests(Throwable cause) {
+        Promise<JsonObject> p;
+        while ((p = pending.poll()) != null) {
+            p.fail(cause);
+        }
+    }
+
+    private void scheduleReconnect(int attempt) {
+        if (attempt >= CONNECT_RETRY_MAX_ATTEMPTS) {
+            log.error(("bus client max reconnect attempts reached connection_key=%s").formatted(connectionKey));
+            return;
+        }
+        long delayMs = computeRetryDelayMs(attempt);
+        log.info(("bus client reconnect scheduled connection_key=%s delay_ms=%d attempt=%d").formatted(connectionKey, delayMs, attempt + 1));
+
+        vertx.timer(delayMs)
+            .compose(ignored -> vertx.createNetClient(new NetClientOptions()
+                    .setReconnectAttempts(0)
+                    .setReconnectInterval(5000)
+                    .setTcpKeepAlive(true)
+                    .setTcpNoDelay(true)
+                    .setIdleTimeout(0)
+                    .setReadIdleTimeout(0))
+                .connect(port, host))
+            .compose(newSocket -> {
+                attachSocketHandlers(newSocket);
+                return sendCommand(new JsonObject()
+                    .put("type", ProtocolTypes.CONNECT)
+                    .put("serviceId", serviceId)
+                    .put("instanceId", instanceId)
+                    .put("token", token));
+            })
+            .onSuccess(v -> {
+                reconnecting.set(false);
+                log.info(("bus client reconnected connection_key=%s remote=%s").formatted(connectionKey, socket.remoteAddress()));
+                startMetricsTimer();
+            })
+            .onFailure(err -> {
+                log.warn(("bus client reconnect failed connection_key=%s attempt=%d cause=%s").formatted(connectionKey, attempt + 1, err.getMessage()));
+                scheduleReconnect(attempt + 1);
+            });
+    }
+
+    private void startMetricsTimer() {
+        metricsTimer.set(vertx.setPeriodic(20_000, id -> publish(
+                "basilisk.metrics.distribution",
+                "basilisk.internal",
+                new JsonObject()
+                    .put("name", "memory_usage")
+                    .put("value", Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory())
+                    .put("unit", "bytes")
+        ).andThen(res -> {
+            if (res.failed()) {
+                log.warn(("bus client metric publish failed connection_key=%s cause=%s").formatted(connectionKey, res.cause() == null ? "unknown" : res.cause().getMessage()));
+                return;
+            }
+            log.info(("bus client metric published connection_key=%s subscribers=%s").formatted(connectionKey, res.result()));
+        })));
     }
 
     private static long computeRetryDelayMs(int attempt) {
@@ -56,7 +151,6 @@ public class BusClient {
         return base + jitter;
     }
 
-
     public static Future<BusClient> connect(Vertx vertx, String host, int port, String serviceId, String instanceId, String token) {
         return connectWithRetry(vertx, host, port, serviceId, instanceId, token, 0);
     }
@@ -68,7 +162,7 @@ public class BusClient {
 
         final var netClient = vertx.createNetClient(
             new NetClientOptions()
-                .setReconnectAttempts(512)
+                .setReconnectAttempts(0)
                 .setReconnectInterval(5000)
                 .setTcpKeepAlive(true)
                 .setTcpNoDelay(true)
@@ -79,32 +173,20 @@ public class BusClient {
         log.info(("bus client connect attempt=%d connection_key=%s target=%s:%d").formatted(attempt + 1, serviceId + ":" + instanceId, host, port));
         return netClient.connect(port, host)
             .compose(socket -> {
-                var client = new BusClient(vertx, serviceId, instanceId, socket);
+                var client = new BusClient(vertx, serviceId, instanceId, host, port, token, socket);
+
                 return client.sendCommand(new JsonObject()
                     .put("type", ProtocolTypes.CONNECT)
                     .put("serviceId", serviceId)
                     .put("instanceId", instanceId)
                     .put("token", token))
                 .andThen(v -> {
-                    if(v.failed()) {
+                    if (v.failed()) {
                         log.warn(("bus client connect handshake failed connection_key=%s cause=%s").formatted(client.connectionKey, v.cause() == null ? "unknown" : v.cause().getMessage()));
                         return;
                     }
-
                     log.info(("bus client authenticated connection_key=%s remote=%s").formatted(client.connectionKey, client.socket.remoteAddress()));
-
-                    vertx.setPeriodic(20_000, id -> client.publish(
-                      "basilisk.metrics.distribution",
-                "basilisk.internal",
-                new JsonObject().put("name", "memory_usage").put("value", Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()).put("unit", "bytes")
-                    ).andThen(res -> {
-                        if(res.failed()) {
-                            log.warn(("bus client metric publish failed connection_key=%s cause=%s").formatted(client.connectionKey, res.cause() == null ? "unknown" : res.cause().getMessage()));
-                            return;
-                        }
-
-                        log.info(("bus client metric published connection_key=%s subscribers=%s").formatted(client.connectionKey, res.result()));
-                    }));
+                    client.startMetricsTimer();
                 })
                 .map(client);
             })
@@ -168,9 +250,10 @@ public class BusClient {
     }
 
     public Future<Void> close() {
-        var promise = Promise.<Void>promise();
+        closed = true;
+        cancelMetricsTimer();
         socket.close();
-        return promise.future();
+        return Future.succeededFuture();
     }
 
     private Future<JsonObject> sendCommand(JsonObject message) {
