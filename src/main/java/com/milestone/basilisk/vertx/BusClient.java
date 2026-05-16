@@ -242,7 +242,7 @@ public class BusClient {
      *
      * @return subscriber count acknowledged by service bus
      */
-    public Future<Integer> publishEvent(JsonObject event) {
+    private Future<Integer> publishEvent(JsonObject event) {
         return sendCommand(new JsonObject().put("type", ProtocolTypes.PUBLISH).put("event", event))
                 .map(message -> message.getInteger("subscriberCount", 0));
     }
@@ -341,10 +341,18 @@ public class BusClient {
                 var type = message.getString("type");
                 if (ProtocolTypes.EVENT.equals(type)) {
                     var event = message.getJsonObject("event");
-                    if (event != null) {
-                        dispatchEvent(event);
+
+                    if (event == null) {
+                        continue;
                     }
-                    continue;
+
+                    var instanceId = Objects.requireNonNullElse(event.getString("instanceId"), this.instanceId);
+                    if (instanceId.equals(this.instanceId)) {
+                        continue;
+                    }
+
+                    //? Okay then.
+                    dispatchEvent(event);
                 }
 
                 if (ProtocolTypes.ACK.equals(type) || ProtocolTypes.ERROR.equals(type) || ProtocolTypes.FORWARD_RESPONSE.equals(type)) {
