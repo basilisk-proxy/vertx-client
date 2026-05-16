@@ -7,12 +7,23 @@ import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
+/**
+ * Top-level Basilisk client that composes gateway registration APIs and service bus APIs.
+ */
 @SuppressWarnings("unused")
 public class BasiliskClient {
+    /** Gateway registry API client. */
     public final GatewayApiClient gateway;
+
+    /** Authenticated service bus client. */
     public final BusClient bus;
+
+    /** Service identifier used during registration/connect. */
     public final String serviceId;
+
+    /** Gateway-issued instance identifier for this client session. */
     public final String instanceId;
+
     private BasiliskClient(GatewayApiClient gateway, BusClient bus, String serviceId, String instanceId) {
         this.gateway = gateway;
         this.bus = bus;
@@ -20,6 +31,12 @@ public class BasiliskClient {
         this.instanceId = instanceId;
     }
 
+    /**
+     * Connects using registration-first semantics.
+     *
+     * <p>The flow is: register an instance on the gateway with empty instance ID, read generated
+     * instance credentials, then authenticate the bus connection using returned identity/token.</p>
+     */
     public static Future<BasiliskClient> connect(Vertx vertx, BasiliskClientConfig config) {
         var gateway = new GatewayApiClient(vertx, config.gatewayBaseUrl());
         var prefixes = new JsonArray();
@@ -44,10 +61,16 @@ public class BasiliskClient {
                         .map(bus -> new BasiliskClient(gateway, bus, config.serviceId(), reg.getString("instanceId"))));
     }
 
+    /**
+     * Deregisters this instance from the gateway service registry.
+     */
     public Future<Void> deregister() {
         return gateway.deregisterInstance(serviceId, instanceId);
     }
 
+    /**
+     * Immutable connect-time configuration for registration and bus authentication.
+     */
     public record BasiliskClientConfig(
             String gatewayBaseUrl,
             String busHost,
