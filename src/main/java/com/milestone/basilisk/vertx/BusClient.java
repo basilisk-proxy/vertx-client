@@ -201,7 +201,7 @@ public class BusClient {
                 log.warn(("bus client metric publish failed connection_key=%s cause=%s").formatted(connectionKey, res.cause() == null ? "unknown" : res.cause().getMessage()));
                 return;
             }
-            log.info(("bus client metric published connection_key=%s subscribers=%s").formatted(connectionKey, res.result()));
+            log.debug(("bus client metric published connection_key=%s subscribers=%s").formatted(connectionKey, res.result()));
         })));
     }
 
